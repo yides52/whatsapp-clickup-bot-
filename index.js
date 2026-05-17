@@ -12,12 +12,11 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const conversations = {};
 const MAX_HISTORY = 20;
  
-// All Bolted Iron Sales lists (except Leads)
 const LISTS = [
-  { name: "Proposals", id: "901413446200" },
-  { name: "Josh Proposals", id: "901413557769" },
-  { name: "Sales To Follow", id: "901413446202" },
-  { name: "Job Status", id: "901413446203" },
+  { name: "Proposals", id: "901413446200", statuses: ["to do", "takeoffs/pricing", "changes needed", "proposal in progress", "jobs on hold", "complete"] },
+  { name: "Josh Proposals", id: "901413557769", statuses: ["to do", "takeoffs/pricing", "changes needed", "proposals in progress", "jobs on hold", "sales to follow", "jobs approved", "job done", "rejected"] },
+  { name: "Sales To Follow", id: "901413446202", statuses: [] },
+  { name: "Job Status", id: "901413446203", statuses: ["additional proposal needed", "jobs confirmed", "deposit received", "job in progress", "to invoice", "collections", "done", "jobs not done", "complete"] },
 ];
  
 async function clickup(method, path, body = null) {
@@ -33,7 +32,6 @@ async function clickup(method, path, body = null) {
   return res.data;
 }
  
-// Search all lists for tasks matching a query
 async function searchTasks(query) {
   const q = query.toLowerCase();
   let matches = [];
@@ -44,7 +42,7 @@ async function searchTasks(query) {
       if (!data.tasks?.length) break;
       for (const t of data.tasks) {
         if (t.name.toLowerCase().includes(q)) {
-          matches.push({ id: t.id, name: t.name, list: list.name });
+          matches.push({ id: t.id, name: t.name, list: list.name, listId: list.id, status: t.status?.status });
         }
       }
       if (!data.last_page) page++;
@@ -59,13 +57,26 @@ async function postComment(taskId, comment) {
   return "✅ Comment posted!";
 }
  
-const SYSTEM_PROMPT = `You are a WhatsApp assistant for Bolted Iron. Your ONLY job is to post comments on ClickUp tasks.
+async function updateStatus(taskId, status) {
+  await clickup("PUT", `/task/${taskId}`, { status });
+  return `✅ Status updated to "${status}"!`;
+}
+ 
+const SYSTEM_PROMPT = `You are a WhatsApp assistant for Bolted Iron. You do 2 things only:
+1. Post comments on ClickUp tasks
+2. Change the status of ClickUp tasks
+ 
+Available lists and their statuses:
+- Proposals: to do, takeoffs/pricing, changes needed, proposal in progress, jobs on hold, complete
+- Josh Proposals: to do, takeoffs/pricing, changes needed, proposals in progress, jobs on hold, sales to follow, jobs approved, job done, rejected
+- Job Status: additional proposal needed, jobs confirmed, deposit received, job in progress, to invoice, collections, done, jobs not done, complete
+- Sales To Follow: (no status changes for this list)
  
 How it works:
-1. User tells you a job address (vaguely) and a comment to post
+1. User mentions a job address and what they want to do (post comment or change status)
 2. You search for matching tasks using search_tasks
-3. If 1 match → post the comment using post_comment
-4. If multiple matches → list them and ask the user which one
+3. If 1 match → do the action directly
+4. If multiple matches → list them and ask which one
 5. If no match → tell the user
  
 When you need to take an action, reply with ONLY this on one line:
@@ -75,16 +86,24 @@ Then add a short message on the next line.
 Actions:
 - search_tasks: params: {query: "address keywords"}
 - post_comment: params: {task_id: "id", comment: "the comment text"}
+- update_status: params: {task_id: "id", status: "exact status name lowercase"}
  
-Keep replies short and casual like WhatsApp. Never make up task IDs.`;
+Rules:
+- Always match status names exactly as listed above (lowercase)
+- Never make up task IDs
+- Keep replies short and casual like WhatsApp`;
  
-async function handleAction(action, params, userPhone) {
+async function handleAction(action, params) {
   if (action === "search_tasks") {
     const matches = await searchTasks(params.query);
     return { type: "search_result", matches };
   }
   if (action === "post_comment") {
     const result = await postComment(params.task_id, params.comment);
+    return { type: "done", message: result };
+  }
+  if (action === "update_status") {
+    const result = await updateStatus(params.task_id, params.status);
     return { type: "done", message: result };
   }
   return { type: "done", message: "Unknown action." };
@@ -114,35 +133,23 @@ async function askClaude(userPhone, userMessage) {
     let parsed;
     try { parsed = JSON.parse(actionMatch[1]); } catch { return visibleText || "Error parsing action."; }
  
-    const result = await handleAction(parsed.action, parsed.params || {}, userPhone);
+    const result = await handleAction(parsed.action, parsed.params || {});
  
     if (result.type === "search_result") {
       const matches = result.matches;
       if (matches.length === 0) {
-        const msg = "I couldn't find any task matching that address. Can you give me more details?";
-        conversations[userPhone].push({ role: "user", content: `[SYSTEM: search returned 0 results]` });
-        return msg;
+        return "I couldn't find any task matching that address. Can you be more specific?";
       }
       if (matches.length === 1) {
-        // Auto-post if only one match
         const m = matches[0];
-        // Extract the comment from visibleText or ask Claude to post it
-        const commentMatch = parsed.params?.comment;
-        if (commentMatch) {
-          await postComment(m.id, commentMatch);
-          return `✅ Comment posted on "${m.name}"!`;
-        } else {
-          // Tell Claude there was 1 match and ask it to post
-          const systemMsg = `[SYSTEM: Found 1 task: "${m.name}" (ID: ${m.id}) in ${m.list}. Now post the comment using post_comment.]`;
-          conversations[userPhone].push({ role: "user", content: systemMsg });
-          return await askClaude(userPhone, systemMsg);
-        }
+        const systemMsg = `[SYSTEM: Found 1 task: "${m.name}" (ID: ${m.id}) in ${m.list}. Current status: ${m.status}. Now perform the requested action on it.]`;
+        conversations[userPhone].push({ role: "user", content: systemMsg });
+        return await askClaude(userPhone, systemMsg);
       }
-      // Multiple matches — ask user
       const list = matches.map((m, i) => `${i + 1}. ${m.name} (${m.list})`).join("\n");
-      const systemMsg = `[SYSTEM: Found ${matches.length} tasks:\n${matches.map(m => `"${m.name}" ID:${m.id} in ${m.list}`).join("\n")}\nAsk the user which one.]`;
+      const systemMsg = `[SYSTEM: Found ${matches.length} tasks:\n${matches.map(m => `"${m.name}" ID:${m.id} in ${m.list} status:${m.status}`).join("\n")}\nAsk the user which one.]`;
       conversations[userPhone].push({ role: "user", content: systemMsg });
-      return `Found ${matches.length} matching tasks:\n${list}\n\nWhich one should I post the comment on?`;
+      return `Found ${matches.length} matching tasks:\n${list}\n\nWhich one?`;
     }
  
     if (result.type === "done") {
@@ -162,7 +169,6 @@ app.post("/webhook", async (req, res) => {
   console.log(`📨 ${fromNumber}: ${incomingMsg}`);
   try {
     const reply = await askClaude(fromNumber, incomingMsg);
-    // Split long messages
     const MAX = 1500;
     if (reply.length > MAX) {
       const parts = reply.match(/.{1,1500}/gs) || [reply];
