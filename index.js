@@ -12,6 +12,18 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const conversations = {};
 const MAX_HISTORY = 20;
  
+// ─── Users ────────────────────────────────────────────────────────────────────
+const USERS = {
+  "+19295915310": "Yides",
+  "+19292751679": "Moshe",
+};
+ 
+function getUserName(from) {
+  // from is like "whatsapp:+19295915310"
+  const number = from.replace("whatsapp:", "");
+  return USERS[number] || "Unknown";
+}
+ 
 const LISTS = [
   { name: "Proposals", id: "901413446200", statuses: ["to do", "takeoffs/pricing", "changes needed", "proposal in progress", "jobs on hold", "complete"] },
   { name: "Josh Proposals", id: "901413557769", statuses: ["to do", "takeoffs/pricing", "changes needed", "proposals in progress", "jobs on hold", "sales to follow", "jobs approved", "job done", "rejected"] },
@@ -62,7 +74,6 @@ async function buildCache() {
   console.log(`✅ Cache built: ${taskCache.length} tasks loaded.`);
 }
  
-// Refresh cache every 60 minutes
 async function startCacheRefresh() {
   await buildCache();
   setInterval(buildCache, 60 * 60 * 1000);
@@ -74,14 +85,14 @@ function searchCache(query) {
 }
  
 // ─── ClickUp actions ──────────────────────────────────────────────────────────
-async function postComment(taskId, comment) {
-  await clickup("POST", `/task/${taskId}/comment`, { comment_text: comment });
+async function postComment(taskId, comment, userName) {
+  await clickup("POST", `/task/${taskId}/comment`, { comment_text: `${userName}: ${comment}` });
   return "✅ Comment posted!";
 }
  
-async function updateStatus(taskId, status) {
+async function updateStatus(taskId, status, userName) {
   await clickup("PUT", `/task/${taskId}`, { status });
-  // Update cache too
+  await clickup("POST", `/task/${taskId}/comment`, { comment_text: `${userName} changed status to: ${status}` });
   const task = taskCache.find((t) => t.id === taskId);
   if (task) task.status = status;
   return `✅ Status updated to "${status}"!`;
@@ -112,7 +123,7 @@ Then add a short message on the next line.
  
 Actions:
 - search_tasks: params: {query: "address keywords"}
-- post_comment: params: {task_id: "id", comment: "the comment text"}
+- post_comment: params: {task_id: "id", comment: "the comment text (WITHOUT the user's name, that is added automatically)"}
 - update_status: params: {task_id: "id", status: "exact status name lowercase"}
  
 Rules:
@@ -123,23 +134,23 @@ Rules:
 - Keep replies short and casual like WhatsApp
 - ALWAYS reply with a confirmation after every action`;
  
-async function handleAction(action, params) {
+async function handleAction(action, params, userName) {
   if (action === "search_tasks") {
     const matches = searchCache(params.query);
     return { type: "search_result", matches };
   }
   if (action === "post_comment") {
-    const result = await postComment(params.task_id, params.comment);
+    const result = await postComment(params.task_id, params.comment, userName);
     return { type: "done", message: result };
   }
   if (action === "update_status") {
-    const result = await updateStatus(params.task_id, params.status);
+    const result = await updateStatus(params.task_id, params.status, userName);
     return { type: "done", message: result };
   }
   return { type: "done", message: "Unknown action." };
 }
  
-async function askClaude(userPhone, userMessage) {
+async function askClaude(userPhone, userMessage, userName) {
   if (!conversations[userPhone]) conversations[userPhone] = [];
   conversations[userPhone].push({ role: "user", content: userMessage });
   if (conversations[userPhone].length > MAX_HISTORY) {
@@ -163,7 +174,7 @@ async function askClaude(userPhone, userMessage) {
     let parsed;
     try { parsed = JSON.parse(actionMatch[1]); } catch { return visibleText || "Error parsing action."; }
  
-    const result = await handleAction(parsed.action, parsed.params || {});
+    const result = await handleAction(parsed.action, parsed.params || {}, userName);
  
     if (result.type === "search_result") {
       const matches = result.matches;
@@ -174,7 +185,7 @@ async function askClaude(userPhone, userMessage) {
         const m = matches[0];
         const systemMsg = `[SYSTEM: Found 1 task: "${m.name}" (ID: ${m.id}) in ${m.list}. Current status: ${m.status}. Now perform the requested action on it.]`;
         conversations[userPhone].push({ role: "user", content: systemMsg });
-        return await askClaude(userPhone, systemMsg);
+        return await askClaude(userPhone, systemMsg, userName);
       }
       const list = matches.map((m, i) => `${i + 1}. ${m.name} (${m.list})`).join("\n");
       const systemMsg = `[SYSTEM: Found ${matches.length} tasks:\n${matches.map(m => `"${m.name}" ID:${m.id} in ${m.list} status:${m.status}`).join("\n")}\nAsk the user which one.]`;
@@ -197,9 +208,11 @@ app.post("/webhook", async (req, res) => {
   const fromNumber = req.body.From;
   if (!incomingMsg || !fromNumber) return res.type("text/xml").send(twiml.toString());
  
-  console.log(`📨 ${fromNumber}: ${incomingMsg}`);
+  const userName = getUserName(fromNumber);
+  console.log(`📨 ${userName} (${fromNumber}): ${incomingMsg}`);
+ 
   try {
-    const reply = await askClaude(fromNumber, incomingMsg);
+    const reply = await askClaude(fromNumber, incomingMsg, userName);
     const MAX = 1500;
     if (reply.length > MAX) {
       const parts = reply.match(/.{1,1500}/gs) || [reply];
@@ -207,7 +220,7 @@ app.post("/webhook", async (req, res) => {
     } else {
       twiml.message(reply);
     }
-    console.log(`🤖 Reply: ${reply}`);
+    console.log(`🤖 Reply to ${userName}: ${reply}`);
   } catch (err) {
     console.error("Error:", err.message);
     twiml.message("⚠️ Something went wrong. Try again.");
@@ -225,3 +238,4 @@ app.listen(PORT, async () => {
   console.log(`🚀 Server running on port ${PORT}`);
   await startCacheRefresh();
 });
+ 
