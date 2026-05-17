@@ -19,6 +19,10 @@ const LISTS = [
   { name: "Job Status", id: "901413446203", statuses: ["additional proposal needed", "jobs confirmed", "deposit received", "job in progress", "to invoice", "collections", "done", "jobs not done", "complete"] },
 ];
  
+// ─── Task Cache ───────────────────────────────────────────────────────────────
+let taskCache = [];
+let cacheLastUpdated = null;
+ 
 async function clickup(method, path, body = null) {
   const res = await axios({
     method,
@@ -32,26 +36,44 @@ async function clickup(method, path, body = null) {
   return res.data;
 }
  
-async function searchTasks(query) {
-  const q = query.toLowerCase();
-  let matches = [];
+async function buildCache() {
+  console.log("🔄 Building task cache...");
+  const allTasks = [];
   for (const list of LISTS) {
     let page = 0;
     while (true) {
       const data = await clickup("GET", `/list/${list.id}/task?page=${page}`);
       if (!data.tasks?.length) break;
       for (const t of data.tasks) {
-        if (t.name.toLowerCase().includes(q)) {
-          matches.push({ id: t.id, name: t.name, list: list.name, listId: list.id, status: t.status?.status });
-        }
+        allTasks.push({
+          id: t.id,
+          name: t.name,
+          list: list.name,
+          listId: list.id,
+          status: t.status?.status,
+        });
       }
       if (!data.last_page) page++;
       else break;
     }
   }
-  return matches;
+  taskCache = allTasks;
+  cacheLastUpdated = new Date();
+  console.log(`✅ Cache built: ${taskCache.length} tasks loaded.`);
 }
  
+// Refresh cache every 60 minutes
+async function startCacheRefresh() {
+  await buildCache();
+  setInterval(buildCache, 60 * 60 * 1000);
+}
+ 
+function searchCache(query) {
+  const q = query.toLowerCase();
+  return taskCache.filter((t) => t.name.toLowerCase().includes(q));
+}
+ 
+// ─── ClickUp actions ──────────────────────────────────────────────────────────
 async function postComment(taskId, comment) {
   await clickup("POST", `/task/${taskId}/comment`, { comment_text: comment });
   return "✅ Comment posted!";
@@ -59,11 +81,15 @@ async function postComment(taskId, comment) {
  
 async function updateStatus(taskId, status) {
   await clickup("PUT", `/task/${taskId}`, { status });
+  // Update cache too
+  const task = taskCache.find((t) => t.id === taskId);
+  if (task) task.status = status;
   return `✅ Status updated to "${status}"!`;
 }
  
+// ─── System prompt ────────────────────────────────────────────────────────────
 const SYSTEM_PROMPT = `You are a WhatsApp assistant for Bolted Iron. You do 2 things only:
-1. Post comments on ClickUp tasks
+1. Post comments on ClickUp tasks (DEFAULT action)
 2. Change the status of ClickUp tasks
  
 Available lists and their statuses:
@@ -95,11 +121,11 @@ Rules:
 - Always match status names exactly as listed above (lowercase)
 - Never make up task IDs
 - Keep replies short and casual like WhatsApp
-- ALWAYS reply with a confirmation after every action (comment posted or status changed)`;
+- ALWAYS reply with a confirmation after every action`;
  
 async function handleAction(action, params) {
   if (action === "search_tasks") {
-    const matches = await searchTasks(params.query);
+    const matches = searchCache(params.query);
     return { type: "search_result", matches };
   }
   if (action === "post_comment") {
@@ -164,6 +190,7 @@ async function askClaude(userPhone, userMessage) {
   return visibleText || "...";
 }
  
+// ─── Webhook ──────────────────────────────────────────────────────────────────
 app.post("/webhook", async (req, res) => {
   const twiml = new twilio.twiml.MessagingResponse();
   const incomingMsg = req.body.Body?.trim();
@@ -188,7 +215,13 @@ app.post("/webhook", async (req, res) => {
   res.type("text/xml").send(twiml.toString());
 });
  
-app.get("/", (req, res) => res.send("WhatsApp ClickUp Bot is running ✅"));
+app.get("/", (req, res) => {
+  const age = cacheLastUpdated ? Math.round((Date.now() - cacheLastUpdated) / 60000) + " mins ago" : "not yet";
+  res.send(`WhatsApp ClickUp Bot ✅ | Cache: ${taskCache.length} tasks | Last updated: ${age}`);
+});
  
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, async () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  await startCacheRefresh();
+});
