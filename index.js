@@ -73,11 +73,12 @@ Available lists and their statuses:
 - Sales To Follow: (no status changes for this list)
  
 How it works:
-1. User mentions a job address and what they want to do (post comment or change status)
+1. User mentions a job address — DEFAULT is to post a comment unless they say "move to" or "change status"
 2. You search for matching tasks using search_tasks
 3. If 1 match → do the action directly
 4. If multiple matches → list them and ask which one
 5. If no match → tell the user
+6. ALWAYS send a confirmation message after every action
  
 When you need to take an action, reply with ONLY this on one line:
 <ACTION>{"action":"ACTION_NAME","params":{...}}</ACTION>
@@ -89,9 +90,12 @@ Actions:
 - update_status: params: {task_id: "id", status: "exact status name lowercase"}
  
 Rules:
+- DEFAULT action is post_comment unless user says "move", "change status", or "set status"
+- If user just says an address + text with no action word → post it as a comment
 - Always match status names exactly as listed above (lowercase)
 - Never make up task IDs
-- Keep replies short and casual like WhatsApp`;
+- Keep replies short and casual like WhatsApp
+- ALWAYS reply with a confirmation after every action (comment posted or status changed)`;
  
 async function handleAction(action, params) {
   if (action === "search_tasks") {
