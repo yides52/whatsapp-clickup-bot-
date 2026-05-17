@@ -1,9 +1,8 @@
-
-
 import express from "express";
 import twilio from "twilio";
 import Anthropic from "@anthropic-ai/sdk";
 import axios from "axios";
+import FormData from "form-data";
  
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -14,14 +13,12 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const conversations = {};
 const MAX_HISTORY = 20;
  
-// ─── Users ────────────────────────────────────────────────────────────────────
 const USERS = {
   "+19295915310": "Yides",
   "+19292751679": "Moshe",
 };
  
 function getUserName(from) {
-  // from is like "whatsapp:+19295915310"
   const number = from.replace("whatsapp:", "");
   return USERS[number] || "Unknown";
 }
@@ -33,7 +30,6 @@ const LISTS = [
   { name: "Job Status", id: "901413446203", statuses: ["additional proposal needed", "jobs confirmed", "deposit received", "job in progress", "to invoice", "collections", "done", "jobs not done", "complete"] },
 ];
  
-// ─── Task Cache ───────────────────────────────────────────────────────────────
 let taskCache = [];
 let cacheLastUpdated = null;
  
@@ -59,13 +55,7 @@ async function buildCache() {
       const data = await clickup("GET", `/list/${list.id}/task?page=${page}`);
       if (!data.tasks?.length) break;
       for (const t of data.tasks) {
-        allTasks.push({
-          id: t.id,
-          name: t.name,
-          list: list.name,
-          listId: list.id,
-          status: t.status?.status,
-        });
+        allTasks.push({ id: t.id, name: t.name, list: list.name, listId: list.id, status: t.status?.status });
       }
       if (!data.last_page) page++;
       else break;
@@ -86,7 +76,32 @@ function searchCache(query) {
   return taskCache.filter((t) => t.name.toLowerCase().includes(q));
 }
  
-// ─── ClickUp actions ──────────────────────────────────────────────────────────
+async function transcribeAudio(mediaUrl) {
+  // Download audio from Twilio
+  const audioRes = await axios.get(mediaUrl, {
+    responseType: "arraybuffer",
+    auth: {
+      username: process.env.TWILIO_ACCOUNT_SID,
+      password: process.env.TWILIO_AUTH_TOKEN,
+    },
+  });
+ 
+  // Send to Groq Whisper
+  const form = new FormData();
+  form.append("file", Buffer.from(audioRes.data), { filename: "audio.ogg", contentType: "audio/ogg" });
+  form.append("model", "whisper-large-v3");
+  form.append("language", "en");
+ 
+  const res = await axios.post("https://api.groq.com/openai/v1/audio/transcriptions", form, {
+    headers: {
+      ...form.getHeaders(),
+      Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+    },
+  });
+ 
+  return res.data.text;
+}
+ 
 async function postComment(taskId, comment, userName) {
   await clickup("POST", `/task/${taskId}/comment`, { comment_text: `${userName}: ${comment}` });
   return "✅ Comment posted!";
@@ -100,8 +115,7 @@ async function updateStatus(taskId, status, userName) {
   return `✅ Status updated to "${status}"!`;
 }
  
-// ─── System prompt ────────────────────────────────────────────────────────────
-const SYSTEM_PROMPT = `You are Emily, the ClickUp assistant for Bolted Iron. You talk like a real person on WhatsApp — warm, casual, and to the point. You know the user by name and use it naturally.
+const SYSTEM_PROMPT = `You are Emily, the ClickUp assistant for Bolted Iron. You are Emily from Bolted Iron ClickUp. Talk like a helpful friend, not a robot. You know the user by name and use it naturally.
  
 You do 2 things:
 1. Post comments on ClickUp tasks (DEFAULT action)
@@ -131,7 +145,7 @@ Actions:
 - update_status: params: {task_id: "id", status: "exact status name lowercase"}
  
 Personality rules:
-- You are Emily from Bolted Iron ClickUp. Talk like a helpful friend, not a robot
+- Talk like a helpful friend, not a robot
 - Use the person's name naturally (e.g. "On it Yides!" or "Got it Moshe!")
 - Use casual language and occasional emojis 👍✅
 - When searching say something like "On it! 🔍" or "Let me find that..."
@@ -189,7 +203,7 @@ async function askClaude(userPhone, userMessage, userName) {
     if (result.type === "search_result") {
       const matches = result.matches;
       if (matches.length === 0) {
-        return "I couldn't find any task matching that address. Can you be more specific?";
+        return `Hmm, can't find that one ${userName} — can you give me a bit more of the address? 🤔`;
       }
       if (matches.length === 1) {
         const m = matches[0];
@@ -200,7 +214,7 @@ async function askClaude(userPhone, userMessage, userName) {
       const list = matches.map((m, i) => `${i + 1}. ${m.name} (${m.list})`).join("\n");
       const systemMsg = `[SYSTEM: Found ${matches.length} tasks:\n${matches.map(m => `"${m.name}" ID:${m.id} in ${m.list} status:${m.status}`).join("\n")}\nAsk the user which one.]`;
       conversations[userPhone].push({ role: "user", content: systemMsg });
-      return `Found ${matches.length} matching tasks:\n${list}\n\nWhich one?`;
+      return `Found a few jobs matching that — which one did you mean?\n\n${list}`;
     }
  
     if (result.type === "done") {
@@ -211,14 +225,32 @@ async function askClaude(userPhone, userMessage, userName) {
   return visibleText || "...";
 }
  
-// ─── Webhook ──────────────────────────────────────────────────────────────────
 app.post("/webhook", async (req, res) => {
   const twiml = new twilio.twiml.MessagingResponse();
-  const incomingMsg = req.body.Body?.trim();
   const fromNumber = req.body.From;
-  if (!incomingMsg || !fromNumber) return res.type("text/xml").send(twiml.toString());
+  const numMedia = parseInt(req.body.NumMedia || "0");
+ 
+  if (!fromNumber) return res.type("text/xml").send(twiml.toString());
  
   const userName = getUserName(fromNumber);
+  let incomingMsg = req.body.Body?.trim();
+ 
+  // Handle voice message
+  if (numMedia > 0 && req.body.MediaContentType0?.includes("audio")) {
+    try {
+      const mediaUrl = req.body.MediaUrl0;
+      console.log(`🎤 Voice message from ${userName}, transcribing...`);
+      incomingMsg = await transcribeAudio(mediaUrl);
+      console.log(`📝 Transcribed: ${incomingMsg}`);
+    } catch (err) {
+      console.error("Transcription error:", err.message);
+      twiml.message("Sorry, I couldn't understand that voice note. Try typing it instead 😊");
+      return res.type("text/xml").send(twiml.toString());
+    }
+  }
+ 
+  if (!incomingMsg) return res.type("text/xml").send(twiml.toString());
+ 
   console.log(`📨 ${userName} (${fromNumber}): ${incomingMsg}`);
  
   try {
@@ -230,7 +262,7 @@ app.post("/webhook", async (req, res) => {
     } else {
       twiml.message(reply);
     }
-    console.log(`🤖 Reply to ${userName}: ${reply}`);
+    console.log(`🤖 Emily to ${userName}: ${reply}`);
   } catch (err) {
     console.error("Error:", err.message);
     twiml.message("⚠️ Something went wrong. Try again.");
@@ -240,12 +272,11 @@ app.post("/webhook", async (req, res) => {
  
 app.get("/", (req, res) => {
   const age = cacheLastUpdated ? Math.round((Date.now() - cacheLastUpdated) / 60000) + " mins ago" : "not yet";
-  res.send(`WhatsApp ClickUp Bot ✅ | Cache: ${taskCache.length} tasks | Last updated: ${age}`);
+  res.send(`Emily (Bolted Iron ClickUp Bot) ✅ | Cache: ${taskCache.length} tasks | Last updated: ${age}`);
 });
  
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🚀 Emily is running on port ${PORT}`);
   await startCacheRefresh();
 });
- 
