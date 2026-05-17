@@ -1,5 +1,3 @@
-
-
 import express from "express";
 import twilio from "twilio";
 import Anthropic from "@anthropic-ai/sdk";
@@ -11,11 +9,16 @@ app.use(express.json());
  
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
  
-// In-memory conversation history per user (keyed by WhatsApp number)
 const conversations = {};
-const MAX_HISTORY = 20; // keep last 20 messages per user
+const MAX_HISTORY = 20;
  
-// ─── ClickUp helpers ──────────────────────────────────────────────────────────
+// All Bolted Iron Sales lists (except Leads)
+const LISTS = [
+  { name: "Proposals", id: "901413446200" },
+  { name: "Josh Proposals", id: "901413557769" },
+  { name: "Sales To Follow", id: "901413446202" },
+  { name: "Job Status", id: "901413446203" },
+];
  
 async function clickup(method, path, body = null) {
   const res = await axios({
@@ -30,129 +33,66 @@ async function clickup(method, path, body = null) {
   return res.data;
 }
  
-async function executeClickUpAction(action, params) {
-  switch (action) {
-    case "get_teams": {
-      const data = await clickup("GET", "/team");
-      if (!data.teams?.length) return "You have no workspaces.";
-      return (
-        "Your workspaces:\n" +
-        data.teams.map((t) => `• ${t.name} (ID: ${t.id})`).join("\n")
-      );
+// Search all lists for tasks matching a query
+async function searchTasks(query) {
+  const q = query.toLowerCase();
+  let matches = [];
+  for (const list of LISTS) {
+    let page = 0;
+    while (true) {
+      const data = await clickup("GET", `/list/${list.id}/task?page=${page}`);
+      if (!data.tasks?.length) break;
+      for (const t of data.tasks) {
+        if (t.name.toLowerCase().includes(q)) {
+          matches.push({ id: t.id, name: t.name, list: list.name });
+        }
+      }
+      if (!data.last_page) page++;
+      else break;
     }
- 
-    case "get_spaces": {
-      const data = await clickup("GET", `/team/${params.team_id}/space`);
-      if (!data.spaces?.length) return "No spaces found.";
-      return (
-        "Spaces:\n" +
-        data.spaces.map((s) => `• ${s.name} (ID: ${s.id})`).join("\n")
-      );
-    }
- 
-    case "get_lists": {
-      const data = await clickup("GET", `/space/${params.space_id}/list`);
-      if (!data.lists?.length) return "No lists found.";
-      return (
-        "Lists:\n" +
-        data.lists.map((l) => `• ${l.name} (ID: ${l.id})`).join("\n")
-      );
-    }
- 
-    case "get_tasks": {
-      const data = await clickup(
-        "GET",
-        `/list/${params.list_id}/task?page=${params.page || 0}`
-      );
-      if (!data.tasks?.length) return "No tasks in that list.";
-      return (
-        `Tasks (${data.tasks.length}):\n` +
-        data.tasks
-          .map((t) => `• [${t.status?.status || "?"}] ${t.name} — ID: ${t.id}`)
-          .join("\n")
-      );
-    }
- 
-    case "create_task": {
-      const data = await clickup("POST", `/list/${params.list_id}/task`, {
-        name: params.name,
-        description: params.description,
-        priority: params.priority,
-        due_date: params.due_date,
-        assignees: params.assignees,
-      });
-      return `✅ Task created: "${data.name}"\nID: ${data.id}`;
-    }
- 
-    case "update_task": {
-      const { task_id, ...body } = params;
-      const data = await clickup("PUT", `/task/${task_id}`, body);
-      return `✅ Updated: "${data.name}"`;
-    }
- 
-    case "close_task": {
-      const data = await clickup("PUT", `/task/${params.task_id}`, {
-        status: "closed",
-      });
-      return `✅ Closed: "${data.name}"`;
-    }
- 
-    case "search_tasks": {
-      const data = await clickup(
-        "GET",
-        `/team/${params.team_id}/task?query=${encodeURIComponent(params.query)}`
-      );
-      if (!data.tasks?.length) return `No tasks found matching "${params.query}".`;
-      return (
-        `Found ${data.tasks.length} task(s):\n` +
-        data.tasks
-          .map((t) => `• ${t.name} (${t.status?.status}) — ID: ${t.id}`)
-          .join("\n")
-      );
-    }
- 
-    default:
-      return `I don't know how to do "${action}" yet.`;
   }
+  return matches;
 }
  
-// ─── System prompt ────────────────────────────────────────────────────────────
+async function postComment(taskId, comment) {
+  await clickup("POST", `/task/${taskId}/comment`, { comment_text: comment });
+  return "✅ Comment posted!";
+}
  
-const SYSTEM_PROMPT = `You are a friendly WhatsApp assistant that helps manage the Bolted Iron Sales ClickUp workspace.
-Speak casually and concisely — like a helpful colleague on WhatsApp.
+const SYSTEM_PROMPT = `You are a WhatsApp assistant for Bolted Iron. Your ONLY job is to post comments on ClickUp tasks.
  
-You only work with these 4 lists (never use any other list):
-- Proposals -> list_id: 901413446200
-- Josh Proposals -> list_id: 901413557769
-- Sales To Follow -> list_id: 901413446202
-- Job Status -> list_id: 901413446203
+How it works:
+1. User tells you a job address (vaguely) and a comment to post
+2. You search for matching tasks using search_tasks
+3. If 1 match → post the comment using post_comment
+4. If multiple matches → list them and ask the user which one
+5. If no match → tell the user
  
-When the user mentions a list by name, use the correct list_id above automatically.
-If the user does not specify a list, ask which one they mean.
+When you need to take an action, reply with ONLY this on one line:
+<ACTION>{"action":"ACTION_NAME","params":{...}}</ACTION>
+Then add a short message on the next line.
  
-When the user wants a ClickUp action, respond with ONLY this format (nothing else on that line):
-<CLICKUP_ACTION>{"action":"ACTION_NAME","params":{...}}</CLICKUP_ACTION>
+Actions:
+- search_tasks: params: {query: "address keywords"}
+- post_comment: params: {task_id: "id", comment: "the comment text"}
  
-Then on the next line, add a short friendly message about what you did.
+Keep replies short and casual like WhatsApp. Never make up task IDs.`;
  
-Supported actions:
-- get_tasks — params: {list_id, page?}
-- create_task — params: {list_id, name, description?, priority?(1-4), due_date?(ms), assignees?([ids])}
-- update_task — params: {task_id, name?, description?, status?, priority?, due_date?}
-- close_task — params: {task_id}
-- search_tasks — params: {team_id: "2279101", query}
- 
-Priority levels: 1=urgent, 2=high, 3=normal, 4=low
-Keep all replies short (WhatsApp style). No markdown headers. No bullet walls.`;
- 
-// ─── Claude handler ───────────────────────────────────────────────────────────
+async function handleAction(action, params, userPhone) {
+  if (action === "search_tasks") {
+    const matches = await searchTasks(params.query);
+    return { type: "search_result", matches };
+  }
+  if (action === "post_comment") {
+    const result = await postComment(params.task_id, params.comment);
+    return { type: "done", message: result };
+  }
+  return { type: "done", message: "Unknown action." };
+}
  
 async function askClaude(userPhone, userMessage) {
   if (!conversations[userPhone]) conversations[userPhone] = [];
- 
   conversations[userPhone].push({ role: "user", content: userMessage });
- 
-  // Trim history
   if (conversations[userPhone].length > MAX_HISTORY) {
     conversations[userPhone] = conversations[userPhone].slice(-MAX_HISTORY);
   }
@@ -167,61 +107,77 @@ async function askClaude(userPhone, userMessage) {
   const rawText = response.content.map((b) => b.text || "").join("");
   conversations[userPhone].push({ role: "assistant", content: rawText });
  
-  // Check for ClickUp action
-  const actionMatch = rawText.match(/<CLICKUP_ACTION>([\s\S]*?)<\/CLICKUP_ACTION>/);
-  const visibleText = rawText
-    .replace(/<CLICKUP_ACTION>[\s\S]*?<\/CLICKUP_ACTION>/g, "")
-    .trim();
+  const actionMatch = rawText.match(/<ACTION>([\s\S]*?)<\/ACTION>/);
+  const visibleText = rawText.replace(/<ACTION>[\s\S]*?<\/ACTION>/g, "").trim();
  
   if (actionMatch) {
     let parsed;
-    try {
-      parsed = JSON.parse(actionMatch[1]);
-    } catch {
-      return visibleText || "I had trouble understanding that action.";
+    try { parsed = JSON.parse(actionMatch[1]); } catch { return visibleText || "Error parsing action."; }
+ 
+    const result = await handleAction(parsed.action, parsed.params || {}, userPhone);
+ 
+    if (result.type === "search_result") {
+      const matches = result.matches;
+      if (matches.length === 0) {
+        const msg = "I couldn't find any task matching that address. Can you give me more details?";
+        conversations[userPhone].push({ role: "user", content: `[SYSTEM: search returned 0 results]` });
+        return msg;
+      }
+      if (matches.length === 1) {
+        // Auto-post if only one match
+        const m = matches[0];
+        // Extract the comment from visibleText or ask Claude to post it
+        const commentMatch = parsed.params?.comment;
+        if (commentMatch) {
+          await postComment(m.id, commentMatch);
+          return `✅ Comment posted on "${m.name}"!`;
+        } else {
+          // Tell Claude there was 1 match and ask it to post
+          const systemMsg = `[SYSTEM: Found 1 task: "${m.name}" (ID: ${m.id}) in ${m.list}. Now post the comment using post_comment.]`;
+          conversations[userPhone].push({ role: "user", content: systemMsg });
+          return await askClaude(userPhone, systemMsg);
+        }
+      }
+      // Multiple matches — ask user
+      const list = matches.map((m, i) => `${i + 1}. ${m.name} (${m.list})`).join("\n");
+      const systemMsg = `[SYSTEM: Found ${matches.length} tasks:\n${matches.map(m => `"${m.name}" ID:${m.id} in ${m.list}`).join("\n")}\nAsk the user which one.]`;
+      conversations[userPhone].push({ role: "user", content: systemMsg });
+      return `Found ${matches.length} matching tasks:\n${list}\n\nWhich one should I post the comment on?`;
     }
  
-    const actionResult = await executeClickUpAction(
-      parsed.action,
-      parsed.params || {}
-    );
- 
-    const finalReply = [visibleText, actionResult].filter(Boolean).join("\n\n");
-    return finalReply;
+    if (result.type === "done") {
+      return result.message;
+    }
   }
  
   return visibleText || "...";
 }
  
-// ─── Webhook endpoint ─────────────────────────────────────────────────────────
- 
 app.post("/webhook", async (req, res) => {
   const twiml = new twilio.twiml.MessagingResponse();
- 
   const incomingMsg = req.body.Body?.trim();
-  const fromNumber = req.body.From; // e.g. "whatsapp:+1234567890"
- 
-  if (!incomingMsg || !fromNumber) {
-    return res.type("text/xml").send(twiml.toString());
-  }
+  const fromNumber = req.body.From;
+  if (!incomingMsg || !fromNumber) return res.type("text/xml").send(twiml.toString());
  
   console.log(`📨 ${fromNumber}: ${incomingMsg}`);
- 
   try {
     const reply = await askClaude(fromNumber, incomingMsg);
+    // Split long messages
+    const MAX = 1500;
+    if (reply.length > MAX) {
+      const parts = reply.match(/.{1,1500}/gs) || [reply];
+      for (const part of parts) twiml.message(part);
+    } else {
+      twiml.message(reply);
+    }
     console.log(`🤖 Reply: ${reply}`);
-    twiml.message(reply);
   } catch (err) {
     console.error("Error:", err.message);
-    twiml.message(
-      "⚠️ Sorry, something went wrong. Try again in a moment."
-    );
+    twiml.message("⚠️ Something went wrong. Try again.");
   }
- 
   res.type("text/xml").send(twiml.toString());
 });
  
-// Health check
 app.get("/", (req, res) => res.send("WhatsApp ClickUp Bot is running ✅"));
  
 const PORT = process.env.PORT || 3000;
