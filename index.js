@@ -14,13 +14,21 @@ const conversations = {};
 const MAX_HISTORY = 20;
  
 const USERS = {
-  "+19295915310": "Yides",
-  "+19292751679": "Moshe",
+  "+19295915310": { name: "Yides", clickupToken: process.env.CLICKUP_API_TOKEN },
+  "+19292751679": { name: "Moshe", clickupToken: "pk_50692553_9E8PZMBPLH1I0ZRDGQSTNHOGIGR8MLZC" },
 };
  
-function getUserName(from) {
+function getUser(from) {
   const number = from.replace("whatsapp:", "");
-  return USERS[number] || "Unknown";
+  return USERS[number] || { name: "Unknown", clickupToken: process.env.CLICKUP_API_TOKEN };
+}
+ 
+function getUserName(from) {
+  return getUser(from).name;
+}
+ 
+function getUserToken(from) {
+  return getUser(from).clickupToken;
 }
  
 const LISTS = [
@@ -102,14 +110,26 @@ async function transcribeAudio(mediaUrl) {
   return res.data.text;
 }
  
-async function postComment(taskId, comment, userName) {
-  await clickup("POST", `/task/${taskId}/comment`, { comment_text: `${userName}: ${comment}` });
+async function clickupAs(token, method, path, body = null) {
+  const res = await axios({
+    method,
+    url: `https://api.clickup.com/api/v2${path}`,
+    headers: {
+      Authorization: token,
+      "Content-Type": "application/json",
+    },
+    data: body || undefined,
+  });
+  return res.data;
+}
+ 
+async function postComment(taskId, comment, userToken) {
+  await clickupAs(userToken, "POST", `/task/${taskId}/comment`, { comment_text: comment });
   return "✅ Comment posted!";
 }
  
-async function updateStatus(taskId, status, userName) {
-  await clickup("PUT", `/task/${taskId}`, { status });
-  await clickup("POST", `/task/${taskId}/comment`, { comment_text: `${userName} changed status to: ${status}` });
+async function updateStatus(taskId, status, userToken) {
+  await clickupAs(userToken, "PUT", `/task/${taskId}`, { status });
   const task = taskCache.find((t) => t.id === taskId);
   if (task) task.status = status;
   return `✅ Status updated to "${status}"!`;
@@ -158,23 +178,23 @@ Personality rules:
 - Always match status names exactly as listed above (lowercase)
 - Never make up task IDs`;
  
-async function handleAction(action, params, userName) {
+async function handleAction(action, params, userName, userToken) {
   if (action === "search_tasks") {
     const matches = searchCache(params.query);
     return { type: "search_result", matches };
   }
   if (action === "post_comment") {
-    const result = await postComment(params.task_id, params.comment, userName);
+    const result = await postComment(params.task_id, params.comment, userToken);
     return { type: "done", message: result };
   }
   if (action === "update_status") {
-    const result = await updateStatus(params.task_id, params.status, userName);
+    const result = await updateStatus(params.task_id, params.status, userToken);
     return { type: "done", message: result };
   }
   return { type: "done", message: "Unknown action." };
 }
  
-async function askClaude(userPhone, userMessage, userName) {
+async function askClaude(userPhone, userMessage, userName, userToken) {
   if (!conversations[userPhone]) conversations[userPhone] = [];
   conversations[userPhone].push({ role: "user", content: userMessage });
   if (conversations[userPhone].length > MAX_HISTORY) {
@@ -198,7 +218,7 @@ async function askClaude(userPhone, userMessage, userName) {
     let parsed;
     try { parsed = JSON.parse(actionMatch[1]); } catch { return visibleText || "Error parsing action."; }
  
-    const result = await handleAction(parsed.action, parsed.params || {}, userName);
+    const result = await handleAction(parsed.action, parsed.params || {}, userName, userToken);
  
     if (result.type === "search_result") {
       const matches = result.matches;
@@ -209,7 +229,7 @@ async function askClaude(userPhone, userMessage, userName) {
         const m = matches[0];
         const systemMsg = `[SYSTEM: Found 1 task: "${m.name}" (ID: ${m.id}) in ${m.list}. Current status: ${m.status}. Now perform the requested action on it.]`;
         conversations[userPhone].push({ role: "user", content: systemMsg });
-        return await askClaude(userPhone, systemMsg, userName);
+        return await askClaude(userPhone, systemMsg, userName, userToken);
       }
       const list = matches.map((m, i) => `${i + 1}. ${m.name} (${m.list})`).join("\n");
       const systemMsg = `[SYSTEM: Found ${matches.length} tasks:\n${matches.map(m => `"${m.name}" ID:${m.id} in ${m.list} status:${m.status}`).join("\n")}\nAsk the user which one.]`;
@@ -233,6 +253,7 @@ app.post("/webhook", async (req, res) => {
   if (!fromNumber) return res.type("text/xml").send(twiml.toString());
  
   const userName = getUserName(fromNumber);
+  const userToken = getUserToken(fromNumber);
   let incomingMsg = req.body.Body?.trim();
  
   // Handle voice message
@@ -254,7 +275,7 @@ app.post("/webhook", async (req, res) => {
   console.log(`📨 ${userName} (${fromNumber}): ${incomingMsg}`);
  
   try {
-    const reply = await askClaude(fromNumber, incomingMsg, userName);
+    const reply = await askClaude(fromNumber, incomingMsg, userName, userToken);
     const MAX = 1500;
     if (reply.length > MAX) {
       const parts = reply.match(/.{1,1500}/gs) || [reply];
@@ -280,3 +301,4 @@ app.listen(PORT, async () => {
   console.log(`🚀 Emily is running on port ${PORT}`);
   await startCacheRefresh();
 });
+ 
