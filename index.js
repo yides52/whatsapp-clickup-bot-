@@ -135,6 +135,21 @@ async function updateStatus(taskId, status, userToken) {
   return `✅ Status updated to "${status}"!`;
 }
  
+async function moveToList(taskId, newListId, status, userToken) {
+  await clickupAs(userToken, "POST", `/task/${taskId}/move/${newListId}`, {});
+  if (status) {
+    await clickupAs(userToken, "PUT", `/task/${taskId}`, { status });
+  }
+  const task = taskCache.find((t) => t.id === taskId);
+  const newList = LISTS.find((l) => l.id === newListId);
+  if (task) {
+    task.listId = newListId;
+    task.list = newList?.name || task.list;
+    if (status) task.status = status;
+  }
+  return `✅ Moved to ${newList?.name || "new list"}${status ? ` and set to "${status}"` : ""}!`;
+}
+ 
 const SYSTEM_PROMPT = `You are Emily, the ClickUp assistant for Bolted Iron. You are Emily from Bolted Iron ClickUp. Talk like a helpful friend, not a robot. You know the user by name and use it naturally.
  
 You do 2 things:
@@ -163,6 +178,13 @@ Actions:
 - search_tasks: params: {query: "address keywords"}
 - post_comment: params: {task_id: "id", comment: "the comment text (WITHOUT the user name, that is added automatically)"}
 - update_status: params: {task_id: "id", status: "exact status name lowercase"}
+- move_to_list: params: {task_id: "id", new_list_id: "list id", status: "status in new list"} — use this when user wants to move a task to a different list. Always ask what status to set in the new list before doing it.
+ 
+List IDs:
+- Proposals: 901413446200
+- Josh Proposals: 901413557769
+- Sales To Follow: 901413446202
+- Job Status: 901413446203
  
 Personality rules:
 - Talk like a helpful friend, not a robot
@@ -189,6 +211,10 @@ async function handleAction(action, params, userName, userToken) {
   }
   if (action === "update_status") {
     const result = await updateStatus(params.task_id, params.status, userToken);
+    return { type: "done", message: result };
+  }
+  if (action === "move_to_list") {
+    const result = await moveToList(params.task_id, params.new_list_id, params.status || null, userToken);
     return { type: "done", message: result };
   }
   return { type: "done", message: "Unknown action." };
