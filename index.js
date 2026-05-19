@@ -60,7 +60,7 @@ async function buildCache() {
   for (const list of LISTS) {
     let page = 0;
     while (true) {
-      const data = await clickup("GET", `/list/${list.id}/task?page=${page}`);
+      const data = await clickup("GET", `/list/${list.id}/task?page=${page}&include_closed=true`);
       if (!data.tasks?.length) break;
       for (const t of data.tasks) {
         allTasks.push({ id: t.id, name: t.name, list: list.name, listId: list.id, status: t.status?.status });
@@ -327,4 +327,3 @@ app.listen(PORT, async () => {
   console.log(`🚀 Emily is running on port ${PORT}`);
   await startCacheRefresh();
 });
- 
