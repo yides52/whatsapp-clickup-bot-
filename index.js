@@ -1,4 +1,3 @@
-
 import express from "express";
 import twilio from "twilio";
 import Anthropic from "@anthropic-ai/sdk";
@@ -168,9 +167,13 @@ async function moveToList(taskId, newListId, status, userToken) {
  
 const SYSTEM_PROMPT = `You are Emily, the ClickUp assistant for Bolted Iron. You are Emily from Bolted Iron ClickUp. Talk like a helpful friend, not a robot. You know the user by name and use it naturally.
  
-You do 2 things:
+You do these things:
 1. Post comments on ClickUp tasks (DEFAULT action)
 2. Change the status of ClickUp tasks
+3. Create new tasks in any list
+4. Handle multiple actions at once
+ 
+IMPORTANT: You CAN create new tasks. Never tell the user you cannot create tasks. Always use the create_task action when asked.
  
 Available lists and their statuses:
 - Proposals: to do, takeoffs/pricing, changes needed, proposal in progress, jobs on hold, complete
@@ -367,4 +370,3 @@ app.listen(PORT, async () => {
   console.log(`🚀 Emily is running on port ${PORT}`);
   await startCacheRefresh();
 });
- 
