@@ -1,5 +1,3 @@
-
-
 import express from "express";
 import twilio from "twilio";
 import Anthropic from "@anthropic-ai/sdk";
@@ -138,7 +136,9 @@ async function updateStatus(taskId, status, userToken) {
 }
  
 async function moveToList(taskId, newListId, status, userToken) {
-  await clickupAs(userToken, "POST", `/task/${taskId}/move/${newListId}`, {});
+  // ClickUp API: move task to another list
+  await clickupAs(userToken, "DELETE", `/list/${newListId}/task/${taskId}`, null).catch(() => {});
+  await clickupAs(userToken, "POST", `/list/${newListId}/task/${taskId}`, {});
   if (status) {
     await clickupAs(userToken, "PUT", `/task/${taskId}`, { status });
   }
@@ -348,3 +348,4 @@ app.listen(PORT, async () => {
   console.log(`🚀 Emily is running on port ${PORT}`);
   await startCacheRefresh();
 });
+ 
