@@ -200,7 +200,7 @@ Actions:
 - post_comment: params: {task_id: "id", comment: "the comment text (WITHOUT the user name, that is added automatically)"}
 - update_status: params: {task_id: "id", status: "exact status name lowercase"}
 - move_to_list: params: {task_id: "id", new_list_id: "list id", status: "status in new list or null"} — use this when user wants to move a task to a different list. If they already told you the status, include it. Only ask if they didn't mention it.
-- create_task: params: {list_id: "id", name: "task name", status: "status or null", comment: "comment text or null"} — use when user wants to create a new task. If user doesn't specify which list, ask them. If the status they mention exists in multiple lists, ask which list. If they specify a comment, post it after creating.
+- create_task: params: {list_id: "id", name: "task name", status: "status or null", comment: "comment text or null"} — use when user wants to create a new task. If user doesn't specify which list, ask them. If user doesn't specify a status, ask them before creating. If the status they mention exists in multiple lists, ask which list. If they specify a comment, post it after creating.
  
 List IDs:
 - Proposals: 901413446200
@@ -370,3 +370,4 @@ app.listen(PORT, async () => {
   console.log(`🚀 Emily is running on port ${PORT}`);
   await startCacheRefresh();
 });
+ 
