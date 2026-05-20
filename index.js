@@ -136,6 +136,19 @@ async function updateStatus(taskId, status, userToken) {
   return `✅ Status updated to "${status}"!`;
 }
  
+async function createTask(listId, name, status, comment, userToken) {
+  const body = { name };
+  if (status) body.status = status;
+  const data = await clickupAs(userToken, "POST", `/list/${listId}/task`, body);
+  if (comment) {
+    await clickupAs(userToken, "POST", `/task/${data.id}/comment`, { comment_text: comment });
+  }
+  // Add to cache
+  const list = LISTS.find((l) => l.id === listId);
+  taskCache.push({ id: data.id, name: data.name, list: list?.name || "Unknown", listId, status: status || "to do" });
+  return `✅ Task "${name}" created${status ? ` with status "${status}"` : ""}${comment ? " and comment posted" : ""}!`;
+}
+ 
 async function moveToList(taskId, newListId, status, userToken) {
   // ClickUp API: move task to another list
   await clickupAs(userToken, "DELETE", `/list/${newListId}/task/${taskId}`, null).catch(() => {});
@@ -184,6 +197,7 @@ Actions:
 - post_comment: params: {task_id: "id", comment: "the comment text (WITHOUT the user name, that is added automatically)"}
 - update_status: params: {task_id: "id", status: "exact status name lowercase"}
 - move_to_list: params: {task_id: "id", new_list_id: "list id", status: "status in new list or null"} — use this when user wants to move a task to a different list. If they already told you the status, include it. Only ask if they didn't mention it.
+- create_task: params: {list_id: "id", name: "task name", status: "status or null", comment: "comment text or null"} — use when user wants to create a new task. If user doesn't specify which list, ask them. If the status they mention exists in multiple lists, ask which list. If they specify a comment, post it after creating.
  
 List IDs:
 - Proposals: 901413446200
@@ -224,6 +238,10 @@ async function handleAction(action, params, userName, userToken) {
   }
   if (action === "move_to_list") {
     const result = await moveToList(params.task_id, params.new_list_id, params.status || null, userToken);
+    return { type: "done", message: result };
+  }
+  if (action === "create_task") {
+    const result = await createTask(params.list_id, params.name, params.status || null, params.comment || null, userToken);
     return { type: "done", message: result };
   }
   return { type: "done", message: "Unknown action." };
@@ -349,3 +367,4 @@ app.listen(PORT, async () => {
   console.log(`🚀 Emily is running on port ${PORT}`);
   await startCacheRefresh();
 });
+ 
