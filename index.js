@@ -1,3 +1,5 @@
+
+
 import express from "express";
 import twilio from "twilio";
 import Anthropic from "@anthropic-ai/sdk";
@@ -170,21 +172,27 @@ How it works:
 5. If no match → tell the user in a friendly way
 6. ALWAYS confirm after every action in a natural, warm way
  
-When you need to take an action, reply with ONLY this on one line:
+When you need to take an action, you can chain MULTIPLE actions in one reply by putting each on its own line:
 <ACTION>{"action":"ACTION_NAME","params":{...}}</ACTION>
-Then add a short friendly message on the next line.
+<ACTION>{"action":"ACTION_NAME","params":{...}}</ACTION>
+ 
+All actions in a single message are executed in order. Add a short friendly summary at the end.
  
 Actions:
 - search_tasks: params: {query: "address keywords"}
 - post_comment: params: {task_id: "id", comment: "the comment text (WITHOUT the user name, that is added automatically)"}
 - update_status: params: {task_id: "id", status: "exact status name lowercase"}
-- move_to_list: params: {task_id: "id", new_list_id: "list id", status: "status in new list"} — use this when user wants to move a task to a different list. Always ask what status to set in the new list before doing it.
+- move_to_list: params: {task_id: "id", new_list_id: "list id", status: "status in new list or null"} — use this when user wants to move a task to a different list. If they already told you the status, include it. Only ask if they didn't mention it.
  
 List IDs:
 - Proposals: 901413446200
 - Josh Proposals: 901413557769
 - Sales To Follow: 901413446202
 - Job Status: 901413446203
+ 
+Example: if user says "move 575 flushing to job status, set to deposit received and post comment updated amount" you should:
+1. search_tasks for "575 flushing"
+2. Once found: move_to_list with status "deposit received" AND post_comment "updated amount" — all in one reply
  
 Personality rules:
 - Talk like a helpful friend, not a robot
@@ -237,34 +245,47 @@ async function askClaude(userPhone, userMessage, userName, userToken) {
   const rawText = response.content.map((b) => b.text || "").join("");
   conversations[userPhone].push({ role: "assistant", content: rawText });
  
-  const actionMatch = rawText.match(/<ACTION>([\s\S]*?)<\/ACTION>/);
+  // Extract all actions
+  const actionMatches = [...rawText.matchAll(/<ACTION>([\s\S]*?)<\/ACTION>/g)];
   const visibleText = rawText.replace(/<ACTION>[\s\S]*?<\/ACTION>/g, "").trim();
  
-  if (actionMatch) {
-    let parsed;
-    try { parsed = JSON.parse(actionMatch[1]); } catch { return visibleText || "Error parsing action."; }
+  if (actionMatches.length > 0) {
+    // Handle search first if present
+    const searchAction = actionMatches.find(m => {
+      try { return JSON.parse(m[1]).action === "search_tasks"; } catch { return false; }
+    });
  
-    const result = await handleAction(parsed.action, parsed.params || {}, userName, userToken);
+    if (searchAction) {
+      let parsed;
+      try { parsed = JSON.parse(searchAction[1]); } catch { return visibleText || "Error parsing action."; }
+      const result = await handleAction(parsed.action, parsed.params || {}, userName, userToken);
  
-    if (result.type === "search_result") {
-      const matches = result.matches;
-      if (matches.length === 0) {
-        return `Hmm, can't find that one ${userName} — can you give me a bit more of the address? 🤔`;
-      }
-      if (matches.length === 1) {
-        const m = matches[0];
-        const systemMsg = `[SYSTEM: Found 1 task: "${m.name}" (ID: ${m.id}) in ${m.list}. Current status: ${m.status}. Now perform the requested action on it.]`;
+      if (result.type === "search_result") {
+        const matches = result.matches;
+        if (matches.length === 0) {
+          return `Hmm, can't find that one ${userName} — can you give me a bit more of the address? 🤔`;
+        }
+        if (matches.length === 1) {
+          const m = matches[0];
+          const systemMsg = `[SYSTEM: Found 1 task: "${m.name}" (ID: ${m.id}) in ${m.list}. Current status: ${m.status}. Now perform ALL the requested actions on it in order.]`;
+          conversations[userPhone].push({ role: "user", content: systemMsg });
+          return await askClaude(userPhone, systemMsg, userName, userToken);
+        }
+        const list = matches.map((m, i) => `${i + 1}. ${m.name} (${m.list})`).join("\n");
+        const systemMsg = `[SYSTEM: Found ${matches.length} tasks:\n${matches.map(m => `"${m.name}" ID:${m.id} in ${m.list} status:${m.status}`).join("\n")}\nAsk the user which one, then perform all requested actions.]`;
         conversations[userPhone].push({ role: "user", content: systemMsg });
-        return await askClaude(userPhone, systemMsg, userName, userToken);
+        return `Found a few jobs matching that — which one did you mean?\n\n${list}`;
       }
-      const list = matches.map((m, i) => `${i + 1}. ${m.name} (${m.list})`).join("\n");
-      const systemMsg = `[SYSTEM: Found ${matches.length} tasks:\n${matches.map(m => `"${m.name}" ID:${m.id} in ${m.list} status:${m.status}`).join("\n")}\nAsk the user which one.]`;
-      conversations[userPhone].push({ role: "user", content: systemMsg });
-      return `Found a few jobs matching that — which one did you mean?\n\n${list}`;
-    }
- 
-    if (result.type === "done") {
-      return result.message;
+    } else {
+      // Execute all non-search actions in order
+      const results = [];
+      for (const match of actionMatches) {
+        let parsed;
+        try { parsed = JSON.parse(match[1]); } catch { continue; }
+        const result = await handleAction(parsed.action, parsed.params || {}, userName, userToken);
+        if (result.type === "done") results.push(result.message);
+      }
+      if (results.length > 0) return results.join("\n");
     }
   }
  
