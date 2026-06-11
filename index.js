@@ -18,8 +18,12 @@ const USERS = {
   "+19292751679": { name: "Moshe", clickupToken: "pk_50692553_9E8PZMBPLH1I0ZRDGQSTNHOGIGR8MLZC" },
 };
  
+// ─── Twilio client for sending reactions ────────────────────────────────────
+const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+ 
 function getUser(from) {
-  const number = from.replace("whatsapp:", "");
+  // Strip whatsapp: prefix and group participant suffix (e.g. whatsapp:+19295915310_groupid)
+  const number = from.replace("whatsapp:", "").split("_")[0];
   return USERS[number] || { name: "Unknown", clickupToken: process.env.CLICKUP_API_TOKEN };
 }
  
@@ -27,7 +31,10 @@ function getUserName(from) {
   return getUser(from).name;
 }
  
-function getUserToken(from) {
+function getUserToken(from, isGroup = false) {
+  // Group messages → post under Emily's ClickUp profile
+  // Private DMs → post under the sender's own ClickUp profile
+  if (isGroup) return process.env.CLICKUP_EMILY_TOKEN;
   return getUser(from).clickupToken;
 }
  
@@ -85,7 +92,6 @@ function searchCache(query) {
 }
  
 async function transcribeAudio(mediaUrl) {
-  // Download audio from Twilio
   const audioRes = await axios.get(mediaUrl, {
     responseType: "arraybuffer",
     auth: {
@@ -94,7 +100,6 @@ async function transcribeAudio(mediaUrl) {
     },
   });
  
-  // Send to Groq Whisper
   const form = new FormData();
   form.append("file", Buffer.from(audioRes.data), { filename: "audio.ogg", contentType: "audio/ogg" });
   form.append("model", "whisper-large-v3");
@@ -123,8 +128,9 @@ async function clickupAs(token, method, path, body = null) {
   return res.data;
 }
  
-async function postComment(taskId, comment, userToken) {
-  await clickupAs(userToken, "POST", `/task/${taskId}/comment`, { comment_text: comment });
+async function postComment(taskId, comment, userToken, senderName = null) {
+  const commentText = senderName ? `${senderName}: ${comment}` : comment;
+  await clickupAs(userToken, "POST", `/task/${taskId}/comment`, { comment_text: commentText });
   return "✅ Comment posted!";
 }
  
@@ -142,14 +148,12 @@ async function createTask(listId, name, status, comment, userToken) {
   if (comment) {
     await clickupAs(userToken, "POST", `/task/${data.id}/comment`, { comment_text: comment });
   }
-  // Add to cache
   const list = LISTS.find((l) => l.id === listId);
   taskCache.push({ id: data.id, name: data.name, list: list?.name || "Unknown", listId, status: status || "to do" });
   return `✅ Task "${name}" created${status ? ` with status "${status}"` : ""}${comment ? " and comment posted" : ""}!`;
 }
  
 async function moveToList(taskId, newListId, status, userToken) {
-  // ClickUp API: move task to another list
   await clickupAs(userToken, "DELETE", `/list/${newListId}/task/${taskId}`, null).catch(() => {});
   await clickupAs(userToken, "POST", `/list/${newListId}/task/${taskId}`, {});
   if (status) {
@@ -163,6 +167,40 @@ async function moveToList(taskId, newListId, status, userToken) {
     if (status) task.status = status;
   }
   return `✅ Moved to ${newList?.name || "new list"}${status ? ` and set to "${status}"` : ""}!`;
+}
+ 
+// ─── React to a WhatsApp message with an emoji ───────────────────────────────
+// messageSid = the SID of the message to react to
+// toNumber   = the group/chat WA number Emily is replying in (req.body.To)
+async function reactToMessage(messageSid, toNumber, emoji = "✅") {
+  try {
+    // Twilio reactions endpoint (WhatsApp Business API via Twilio)
+    // This sends an in-chat emoji reaction to a specific message SID
+    await twilioClient.messages.create({
+      from: toNumber,                       // Emily's Twilio WA number
+      to: toNumber,                         // same group/chat
+      body: "",                             // required field — empty for reaction
+      contentSid: undefined,
+      // Reaction payload via Twilio's WhatsApp reaction support
+      persistentAction: [`react:${messageSid}:${emoji}`],
+    });
+    console.log(`👍 Reacted ${emoji} to message ${messageSid}`);
+  } catch (err) {
+    // Reactions may not be supported in sandbox — log but don't crash
+    console.warn("⚠️ Could not send reaction (may need WA Business API):", err.message);
+  }
+}
+ 
+// ─── Detect if Emily was tagged in a group message ──────────────────────────
+// Returns true if the message body contains @Emily (case-insensitive)
+function isTaggedEmily(body = "") {
+  return /\@emily/i.test(body);
+}
+ 
+// ─── Extract the actual instruction from a tagged group message ──────────────
+// Strips the @Emily mention so Claude only sees the real instruction
+function extractInstruction(body = "") {
+  return body.replace(/@emily/gi, "").trim();
 }
  
 const SYSTEM_PROMPT = `You are Emily, the ClickUp assistant for Bolted Iron. You are Emily from Bolted Iron ClickUp. Talk like a helpful friend, not a robot. You know the user by name and use it naturally.
@@ -224,15 +262,20 @@ Personality rules:
 - Keep all replies short — this is WhatsApp not email
 - DEFAULT action is post_comment unless user says "move", "change status", or "set status"
 - Always match status names exactly as listed above (lowercase)
-- Never make up task IDs`;
+- Never make up task IDs
  
-async function handleAction(action, params, userName, userToken) {
+GROUP CHAT RULES:
+- When someone tags you in a group, the quoted/replied message is their instruction
+- Keep responses brief since the whole group can see them
+- Always address the person who tagged you by name`;
+ 
+async function handleAction(action, params, userName, userToken, isGroup = false) {
   if (action === "search_tasks") {
     const matches = searchCache(params.query);
     return { type: "search_result", matches };
   }
   if (action === "post_comment") {
-    const result = await postComment(params.task_id, params.comment, userToken);
+    const result = await postComment(params.task_id, params.comment, userToken, isGroup ? userName : null);
     return { type: "done", message: result };
   }
   if (action === "update_status") {
@@ -250,7 +293,7 @@ async function handleAction(action, params, userName, userToken) {
   return { type: "done", message: "Unknown action." };
 }
  
-async function askClaude(userPhone, userMessage, userName, userToken) {
+async function askClaude(userPhone, userMessage, userName, userToken, isGroup = false) {
   if (!conversations[userPhone]) conversations[userPhone] = [];
   conversations[userPhone].push({ role: "user", content: userMessage });
   if (conversations[userPhone].length > MAX_HISTORY) {
@@ -267,12 +310,10 @@ async function askClaude(userPhone, userMessage, userName, userToken) {
   const rawText = response.content.map((b) => b.text || "").join("");
   conversations[userPhone].push({ role: "assistant", content: rawText });
  
-  // Extract all actions
   const actionMatches = [...rawText.matchAll(/<ACTION>([\s\S]*?)<\/ACTION>/g)];
   const visibleText = rawText.replace(/<ACTION>[\s\S]*?<\/ACTION>/g, "").trim();
  
   if (actionMatches.length > 0) {
-    // Handle search first if present
     const searchAction = actionMatches.find(m => {
       try { return JSON.parse(m[1]).action === "search_tasks"; } catch { return false; }
     });
@@ -280,52 +321,84 @@ async function askClaude(userPhone, userMessage, userName, userToken) {
     if (searchAction) {
       let parsed;
       try { parsed = JSON.parse(searchAction[1]); } catch { return visibleText || "Error parsing action."; }
-      const result = await handleAction(parsed.action, parsed.params || {}, userName, userToken);
+      const result = await handleAction(parsed.action, parsed.params || {}, userName, userToken, isGroup);
  
       if (result.type === "search_result") {
         const matches = result.matches;
         if (matches.length === 0) {
-          return `Hmm, can't find that one ${userName} — can you give me a bit more of the address? 🤔`;
+          return { text: `Hmm, can't find that one ${userName} — can you give me a bit more of the address? 🤔`, done: false };
         }
         if (matches.length === 1) {
           const m = matches[0];
           const systemMsg = `[SYSTEM: Found 1 task: "${m.name}" (ID: ${m.id}) in ${m.list}. Current status: ${m.status}. Now perform ALL the requested actions on it in order.]`;
           conversations[userPhone].push({ role: "user", content: systemMsg });
-          return await askClaude(userPhone, systemMsg, userName, userToken);
+          return await askClaude(userPhone, systemMsg, userName, userToken, isGroup);
         }
         const list = matches.map((m, i) => `${i + 1}. ${m.name} (${m.list})`).join("\n");
         const systemMsg = `[SYSTEM: Found ${matches.length} tasks:\n${matches.map(m => `"${m.name}" ID:${m.id} in ${m.list} status:${m.status}`).join("\n")}\nAsk the user which one, then perform all requested actions.]`;
         conversations[userPhone].push({ role: "user", content: systemMsg });
-        return `Found a few jobs matching that — which one did you mean?\n\n${list}`;
+        return { text: `Found a few jobs matching that — which one did you mean?\n\n${list}`, done: false };
       }
     } else {
-      // Execute all non-search actions in order
+      // Execute all non-search actions — these are real ClickUp changes → done = true
       const results = [];
       for (const match of actionMatches) {
         let parsed;
         try { parsed = JSON.parse(match[1]); } catch { continue; }
-        const result = await handleAction(parsed.action, parsed.params || {}, userName, userToken);
+        const result = await handleAction(parsed.action, parsed.params || {}, userName, userToken, isGroup);
         if (result.type === "done") results.push(result.message);
       }
-      if (results.length > 0) return results.join("\n");
+      if (results.length > 0) return { text: results.join("\n"), done: true };
     }
   }
  
-  return visibleText || "...";
+  return { text: visibleText || "...", done: false };
 }
  
 app.post("/webhook", async (req, res) => {
   const twiml = new twilio.twiml.MessagingResponse();
-  const fromNumber = req.body.From;
+  const fromNumber = req.body.From;   // who sent the message
+  const toNumber = req.body.To;       // Emily's Twilio WA number (or group)
   const numMedia = parseInt(req.body.NumMedia || "0");
+  const isGroup = req.body.To?.includes("whatsapp:") && req.body.GroupId;
+  const originalMessageSid = req.body.MessageSid; // SID of incoming message to react to
  
   if (!fromNumber) return res.type("text/xml").send(twiml.toString());
  
-  const userName = getUserName(fromNumber);
-  const userToken = getUserToken(fromNumber);
-  let incomingMsg = req.body.Body?.trim();
+  // ─── GROUP CHAT: only respond when tagged @Emily ──────────────────────────
+  if (isGroup) {
+    const rawBody = req.body.Body?.trim() || "";
+    if (!isTaggedEmily(rawBody)) {
+      // Not tagged — silently ignore
+      return res.type("text/xml").send(twiml.toString());
+    }
+  }
  
-  // Handle voice message
+  const userName = getUserName(fromNumber);
+  const userToken = getUserToken(fromNumber, isGroup);
+ 
+  // ─── Build instruction: use quoted/replied message if available ───────────
+  // Twilio passes the replied-to message body in OriginalRepliedMessageBody
+  let incomingMsg;
+  const quotedMessage = req.body.OriginalRepliedMessageBody?.trim();
+  const tagBody = req.body.Body?.trim() || "";
+ 
+  if (isGroup && quotedMessage) {
+    // They replied to a message and tagged Emily — use the quoted message as instruction
+    // Strip any @Emily from the tag message and combine if there's extra instruction
+    const tagInstruction = extractInstruction(tagBody);
+    incomingMsg = tagInstruction
+      ? `${quotedMessage} — ${tagInstruction}`  // e.g. "466 Lafayette client called — post comment"
+      : quotedMessage;
+  } else if (isGroup) {
+    // Tagged in group but no quote — use the tag message itself (minus @Emily)
+    incomingMsg = extractInstruction(tagBody);
+  } else {
+    // ─── Direct/private message — original flow ───────────────────────────
+    incomingMsg = tagBody;
+  }
+ 
+  // Handle voice note
   if (numMedia > 0 && req.body.MediaContentType0?.includes("audio")) {
     try {
       const mediaUrl = req.body.MediaUrl0;
@@ -341,10 +414,15 @@ app.post("/webhook", async (req, res) => {
  
   if (!incomingMsg) return res.type("text/xml").send(twiml.toString());
  
-  console.log(`📨 ${userName} (${fromNumber}): ${incomingMsg}`);
+  console.log(`📨 ${userName} (${fromNumber})${isGroup ? " [GROUP]" : ""}: ${incomingMsg}`);
  
   try {
-    const reply = await askClaude(fromNumber, incomingMsg, userName, userToken);
+    // Use fromNumber as conversation key for DMs, group ID for groups
+    const convKey = isGroup ? req.body.GroupId : fromNumber;
+    const result = await askClaude(convKey, incomingMsg, userName, userToken, isGroup);
+    const reply = typeof result === "string" ? result : result.text;
+    const actionDone = typeof result === "object" ? result.done : false;
+ 
     const MAX = 1500;
     if (reply.length > MAX) {
       const parts = reply.match(/.{1,1500}/gs) || [reply];
@@ -352,11 +430,20 @@ app.post("/webhook", async (req, res) => {
     } else {
       twiml.message(reply);
     }
+ 
     console.log(`🤖 Emily to ${userName}: ${reply}`);
+ 
+    // ─── React ✅ to the original message when a real action was completed ──
+    if (actionDone && isGroup && originalMessageSid) {
+      // Send reaction after we've already responded (non-blocking)
+      reactToMessage(originalMessageSid, toNumber, "✅").catch(console.warn);
+    }
+ 
   } catch (err) {
     console.error("Error:", err.message);
     twiml.message("⚠️ Something went wrong. Try again.");
   }
+ 
   res.type("text/xml").send(twiml.toString());
 });
  
